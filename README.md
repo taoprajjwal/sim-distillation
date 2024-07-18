@@ -1,5 +1,6 @@
 Script does distillation on tasks of the GLUE dataset. Might need modification for non GLUE tasks. To run, I'm currently using
 
+```
 python distill_glue.py \
   --task_name rte \
   --teacher_model /scratch/pb2276/GLUE-pretrain/out_p2_l/rte \
@@ -13,4 +14,5 @@ python distill_glue.py \
   --num_train_epochs 3 \
   --output_dir distill_pure/rte/ \
   --save_strategy epoch \
-  --eval_strategy epoch 
+  --eval_strategy epoch
+```

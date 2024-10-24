@@ -1,4 +1,20 @@
-"""Adopted from run_glue.py"""
+#!/usr/bin/env python
+# coding=utf-8
+# Copyright 2020 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Finetuning the library models for sequence classification on GLUE."""
+# You can also adapt this script on your own text classification task. Pointers for this are left as comments.
 
 import logging
 import os
@@ -27,9 +43,9 @@ from transformers import (
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils import check_min_version
+from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
-from distillation import DistillationLoss, DistilTrainer
+
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 #check_min_version("4.42.0.dev0")
@@ -150,7 +166,10 @@ class ModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
     """
-    
+
+    model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
     config_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
     )
@@ -188,21 +207,11 @@ class ModelArguments:
             )
         },
     )
-    
     ignore_mismatched_sizes: bool = field(
         default=False,
         metadata={"help": "Will enable to load a pretrained model whose head dimensions are different."},
     )
 
-    student_model: str = field(default=None, metadata={"help": "String path for the student model."}, )
-    
-    teacher_model: str = field(default=None, metadata={"help": "String path for the teacher model."}, )
-    
-    gamma: float=field(default=0.6, metadata={"help": "Gamma used for balancing between sim loss and KL div"},)
-    
-    similarity: str= field(default="linear", metadata={"help": "Similarity measure to use. One of linear, cosine, cka, euclidean"}, )
-    
-    include_targets :bool = field(default=False, metadata={"help": "Include cross entropy loss on targets during fine-tuning"},)
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -217,6 +226,9 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
+    # information sent is the one passed as arguments along with your Python/PyTorch versions.
+    send_example_telemetry("run_glue", model_args, data_args)
 
     # Setup logging
     logging.basicConfig(
@@ -353,12 +365,34 @@ def main():
     # Load pretrained model and tokenizer
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab
-
-    teacher_model=AutoModelForSequenceClassification.from_pretrained(model_args.teacher_model)
-    student_model=AutoModelForSequenceClassification.from_pretrained(model_args.student_model)
-
-    tokenizer=AutoTokenizer.from_pretrained(model_args.student_model)
+    # download model & vocab.
+    config = AutoConfig.from_pretrained(
+        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        num_labels=num_labels,
+        finetuning_task=data_args.task_name,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        token=model_args.token,
+        trust_remote_code=model_args.trust_remote_code,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        use_fast=model_args.use_fast_tokenizer,
+        revision=model_args.model_revision,
+        token=model_args.token,
+        trust_remote_code=model_args.trust_remote_code,
+    )
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        config=config,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        token=model_args.token,
+        trust_remote_code=model_args.trust_remote_code,
+        ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+    )
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -382,7 +416,7 @@ def main():
         padding = False
 
     # Some models have set the order of the labels to use, so let's make sure we do use it.
-    """label_to_id = None
+    label_to_id = None
     if (
         model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
         and data_args.task_name is not None
@@ -413,8 +447,6 @@ def main():
             f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the "
             f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
         )
-        """
-
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
     def preprocess_function(examples):
@@ -425,8 +457,8 @@ def main():
         result = tokenizer(*args, padding=padding, max_length=max_seq_length, truncation=True)
 
         # Map labels to IDs (not necessary for GLUE tasks)
-        #if label_to_id is not None and "label" in examples:
-         #   result["label"] = [(label_to_id[l] if l != -1 else -1) for l in examples["label"]]
+        if label_to_id is not None and "label" in examples:
+            result["label"] = [(label_to_id[l] if l != -1 else -1) for l in examples["label"]]
         return result
 
     with training_args.main_process_first(desc="dataset map pre-processing"):
@@ -436,7 +468,6 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
-        raw_datasets.set_format("pt", columns=["input_ids","token_type_ids","attention_mask", "label"], output_all_columns=False)
     if training_args.do_train:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
@@ -493,24 +524,15 @@ def main():
     else:
         data_collator = None
 
-    if training_args.label_names is None:
-        training_args.label_names=["labels"]
-    training_args.remove_unused_columns=False
-    #similarity loss function
-    loss_fn=DistillationLoss(similarity_measure=model_args.similarity, align_match=[[3,6,9], [6,12,18]], gamma=model_args.gamma)
     # Initialize our Trainer
-
-    print(f"Loss function inlucde_targets is {model_args.include_targets}")
-
-    trainer = DistilTrainer(student_model=student_model, 
-                            teacher_model=teacher_model, 
-                            loss_fn=loss_fn, args=training_args, 
-                            train_dataset=train_dataset if training_args.do_train else None, 
-                            eval_dataset=eval_dataset if training_args.do_eval else None, 
-                            compute_metrics=compute_metrics,
-                            tokenizer=tokenizer,
-                            data_collator=data_collator,
-                            include_targets=model_args.include_targets
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        compute_metrics=compute_metrics,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
     )
 
     # Training
@@ -592,8 +614,8 @@ def main():
                         else:
                             item = label_list[item]
                             writer.write(f"{index}\t{item}\n")
-    
-    kwargs = {"finetuned_from": "custom  model", "tasks": "text-classification"}
+
+    kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-classification"}
     if data_args.task_name is not None:
         kwargs["language"] = "en"
         kwargs["dataset_tags"] = "glue"

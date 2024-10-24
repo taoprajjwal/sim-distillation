@@ -1,13 +1,43 @@
 import torch
 from torch import Tensor
-from torch.nn.functional import pad
-
+from torch.nn.functional import pad, mse_loss
+import random
 from typing import Literal, Tuple, Optional, List
 
 
+
+class MSE_w_padding(torch.nn.Module):
+
+    def __init__(self, dim_matching='zero_pad', reduction="mean"):
+        super(MSE_w_padding, self).__init__()
+        self.dim_matching = dim_matching
+        self.reduction = reduction
+        
+    def forward(self, X, Y):
+        if X.shape[:-1] != Y.shape[:-1] or X.ndim != 3 or Y.ndim != 3:
+            raise ValueError('Expected 3D input matrices to much in all dimensions but last.'
+                             f'But got {X.shape} and {Y.shape} instead.')
+
+        if X.shape[-1] != Y.shape[-1]:
+            if self.dim_matching is None or self.dim_matching == 'none':
+                raise ValueError(f'Expected same dimension matrices got instead {X.shape} and {Y.shape}. '
+                                 f'Set dim_matching or change matrix dimensions.')
+            elif self.dim_matching == 'zero_pad':
+                size_diff = Y.shape[-1] - X.shape[-1]
+                if size_diff < 0:
+                    raise ValueError(f'With `zero_pad` dimension matching expected X dimension to be smaller then Y. '
+                                     f'But got {X.shape} and {Y.shape} instead.')
+                X = pad(X, (0, size_diff))
+            elif self.dim_matching == 'pca':
+                raise NotImplementedError
+            else:
+                raise ValueError(f'Unrecognized dimension matching {self.dim_matching}')
+
+        return mse_loss(X,Y, reduction = self.reduction)
+        
 class LinearMeasure(torch.nn.Module):
     def __init__(self,
-                 alpha=1, center_columns=True, dim_matching='zero_pad', svd_grad=True, reduction='mean', no_svd=True):
+                 alpha=1, center_columns=True, dim_matching='zero_pad', svd_grad=False, reduction='mean', no_svd=True):
         super(LinearMeasure, self).__init__()
         self.register_buffer('alpha', torch.tensor(alpha))
         assert dim_matching in [None, 'none', 'zero_pad', 'pca']
@@ -89,6 +119,102 @@ class LinearMeasure(torch.nn.Module):
         else:
             raise ValueError(f'Unrecognized reduction {self.reduction}')
 
+
+class CKA(torch.nn.Module):
+    def __init__(self,dim_matching='zero_pad', reduction='mean', kernel="linear", similarity_token_strategy="flatten"):
+        super(CKA, self).__init__()
+        assert dim_matching in [None, 'none', 'zero_pad', 'pca']
+        self.dim_matching = dim_matching
+        self.reduction = reduction
+        self.kernel=kernel
+        self.similarity_token_strategy=similarity_token_strategy
+        self.random_tokens=None
+
+
+    def generate_random_token_index(self, token_size, selected_size=10):
+        self.random_tokens = random.sample(range(token_size),selected_size) 
+    
+    def create_sim_matrix(self, X:Tensor, diag_zero=True):
+        if self.similarity_token_strategy =="flatten":
+            X=torch.flatten(X, end_dim=-2)
+        elif self.similarity_token_strategy=="random":
+            if not self.random_tokens:
+                self.generate_random_token_index(X.shape[1])
+            X=torch.fatten(X[:, self.random_tokens, :], end_dim=-2)
+            
+        """Similarity matrix"""
+        if self.kernel == "linear":
+            sim_m = X@ X.T
+        else:
+            raise NotImplementedError
+
+        if diag_zero:
+            diagonal_mask = torch.eye(sim_m.shape[-1], dtype=torch.bool).unsqueeze(0).to(X.device)
+
+            #has a batch dimension
+            if len(sim_m.shape)>2:
+                sim_m.masked_fill_(diagonal_mask, 0)
+            else:
+                sim_m.masked_fill_(diagonal_mask[0], 0)
+        
+        return sim_m
+
+
+    def HSIC(self, K,L):
+        """ K, L are similarity matrices of form (B,N,N) where B is batch or (N,N)
+        """
+        n=K.shape[-1]
+        if len(K.shape)==3:
+            pass
+            #TODO: IMPLEMENT BATCHED CKA
+            """
+            kl=torch.bmm(K,L)"""
+            
+        else:
+            kl=K@L
+            trace=kl.diagonal().sum()
+            middle=(K.sum()*L.sum())/((n-1)*(n-2))
+            last= -2*kl.sum()/(n-2)
+            return (trace+middle+last)/(n*(n-3))
+
+
+    def forward(self, X: Tensor, Y: Tensor):
+        if X.shape[:-1] != Y.shape[:-1] or X.ndim != 3 or Y.ndim != 3:
+            raise ValueError('Expected 3D input matrices to match in all dimensions but last.'
+                             f'But got {X.shape} and {Y.shape} instead.')
+
+        if X.shape[-1] != Y.shape[-1]:
+            if self.dim_matching is None or self.dim_matching == 'none':
+                raise ValueError(f'Expected same dimension matrices got instead {X.shape} and {Y.shape}. '
+                                 f'Set dim_matching or change matrix dimensions.')
+            elif self.dim_matching == 'zero_pad':
+                size_diff = Y.shape[-1] - X.shape[-1]
+                if size_diff < 0:
+                    raise ValueError(f'With `zero_pad` dimension matching expected X dimension to be smaller then Y. '
+                                     f'But got {X.shape} and {Y.shape} instead.')
+                X = pad(X, (0, size_diff))
+            elif self.dim_matching == 'pca':
+                raise NotImplementedError
+            else:
+                raise ValueError(f'Unrecognized dimension matching {self.dim_matching}')
+
+        X_sim_matrix = self.create_sim_matrix(X)
+        Y_sim_matrix = self.create_sim_matrix(Y)
+
+        self_hsic_x=self.HSIC(X_sim_matrix, X_sim_matrix)
+        self_hsic_y= self.HSIC(Y_sim_matrix, Y_sim_matrix)
+        cross_hsic=self.HSIC(X_sim_matrix, Y_sim_matrix)
+        
+        batched_cka = cross_hsic/ (torch.sqrt(self_hsic_x) * torch.sqrt(self_hsic_y))
+            
+        if self.reduction == 'mean':
+            return batched_cka.mean()
+        elif self.reduction == 'sum':
+            return batched_cka.sum()
+        elif self.reduction == 'none' or self.reduction is None:
+            return batched_cka
+        else:
+            raise ValueError(f'Unrecognized reduction {self.reduction}')
 
 class EnergyMetric(torch.nn.Module):
 

@@ -2,7 +2,7 @@ from typing import List, Optional, Tuple
 from torch import nn, Tensor
 from torch.nn import functional as F
 import torch
-from similarity_measures import LinearMeasure
+from similarity_measures import LinearMeasure, CKA, MSE_w_padding
 from transformers import Trainer
 
 
@@ -65,6 +65,10 @@ class DistillationLoss(nn.Module):
             self.similarity_loss = nn.CosineEmbeddingLoss()
         elif similarity_measure == 'linear':
             self.similarity_loss = LinearMeasure(**similarity_measure_kwargs)
+        elif similarity_measure =="cka":
+            self.similarity_loss=CKA(**similarity_measure_kwargs)
+        elif similarity_measure == "euclidean":
+            self.similarity_loss = MSE_w_padding()
         elif similarity_measure is None or similarity_measure == 'none':
             self.similarity_loss = None
         else:
@@ -82,7 +86,7 @@ class DistillationLoss(nn.Module):
             soft_teacher = F.softmax(teacher_logits / self.temperature, dim=-1)
             kl_loss = self.kl_div(soft_log_student, soft_teacher)
         else:
-            kl_loss=0
+            kl_loss=torch.tensor(0, device=student_logits.device)
 
         output = (1-self.gamma) * self.temperature ** 2 * kl_loss
 
@@ -112,7 +116,7 @@ class DistillationLoss(nn.Module):
                                                 to_align_teacher.flatten(end_dim=1),
                                                 torch.ones(to_align_student.shape[0] * to_align_student.shape[1],
                                                            device=to_align_student.device).long())
-            elif self.similarity_measure == 'linear':
+            elif self.similarity_measure in["linear", "cka", "euclidean"]:
                 sim_loss= self.similarity_loss(to_align_student, to_align_teacher)
             else:
                 raise NotImplementedError
@@ -126,13 +130,16 @@ class DistillationLoss(nn.Module):
 
 
 class DistilTrainer(Trainer):
-    def __init__(self, student_model=None, teacher_model=None, loss_fn=None, temperature=None, *args, **kwargs):
+    def __init__(self, student_model=None, teacher_model=None, loss_fn=None, temperature=None, include_targets=False, *args, **kwargs):
         model = DistilModel(student_model, teacher_model)
         super().__init__(model=model, *args, **kwargs)
         self.temperature = temperature if temperature else 1.
         self.loss_fn = loss_fn
+        self.include_targets=include_targets
 
     def compute_loss(self, model, inputs, return_outputs=False):
         student_output, teacher_output = model(**inputs)
         loss=self.loss_fn(student_output.logits, teacher_output.logits, student_output.hidden_states, teacher_output.hidden_states)
+        if self.include_targets:
+            loss+=F.cross_entropy(student_output.logits, inputs["labels"])
         return (loss, student_output) if return_outputs else loss

@@ -4,6 +4,15 @@ from torch.nn.functional import pad, mse_loss
 import random
 from typing import Literal, Tuple, Optional, List
 
+def gaussian_kernel(X: torch.Tensor, Y: torch.Tensor, sigma: float = None) -> torch.Tensor:
+  
+    X_norm_sq = (X ** 2).sum(dim=1).view(-1, 1)  # (n, 1)
+    Y_norm_sq = (Y ** 2).sum(dim=1).view(1, -1)  # (1, m)
+    dist_sq = X_norm_sq + Y_norm_sq - 2 * X@Y.T
+    if not sigma:
+        sigma=torch.median(dist_sq)/2
+    K = torch.exp(-dist_sq /  (torch.sqrt(sigma)))
+    return K
 
 
 class MSE_w_padding(torch.nn.Module):
@@ -37,7 +46,7 @@ class MSE_w_padding(torch.nn.Module):
         
 class LinearMeasure(torch.nn.Module):
     def __init__(self,
-                 alpha=1, center_columns=True, dim_matching='zero_pad', svd_grad=False, reduction='mean', no_svd=True):
+                 alpha=1, center_columns=True, dim_matching='zero_pad', svd_grad=False, reduction='mean', no_svd=True, approx=False):
         super(LinearMeasure, self).__init__()
         self.register_buffer('alpha', torch.tensor(alpha))
         assert dim_matching in [None, 'none', 'zero_pad', 'pca']
@@ -46,6 +55,7 @@ class LinearMeasure(torch.nn.Module):
         self.svd_grad = svd_grad
         self.reduction = reduction
         self.no_svd = no_svd
+        self.approx = approx
 
     def partial_fit(self, X: Tensor) -> Tuple[Tensor, Tensor]:
         """Computes the mean centered columns. Can be replaced later by whitening transform for linear invarariances."""
@@ -56,6 +66,12 @@ class LinearMeasure(torch.nn.Module):
         wx = X - mx
 
         return mx, wx
+
+    def create_sim_matrix(self, X:Tensor):
+        X=torch.flatten(X, end_dim=-2)
+        sim_m = X@ X.T
+            
+        return sim_m
 
     def fit(self, X: Tensor, Y: Tensor) -> Tuple[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor]]:
         mx, wx = self.partial_fit(X)
@@ -97,18 +113,36 @@ class LinearMeasure(torch.nn.Module):
             else:
                 raise ValueError(f'Unrecognized dimension matching {self.dim_matching}')
 
-        if self.no_svd and X.shape[1] == 1:
+        if self.approx:
             mx, wx = self.partial_fit(X)
             my, wy = self.partial_fit(Y)
 
-            x_norm = torch.linalg.norm(wx, dim=(1, 2))
-            y_norm = torch.linalg.norm(wy, dim=(1, 2))
+            wx=torch.flatten(wx,end_dim=-2)
+            wy=torch.flatten(wy,end_dim=-2)
 
-            norms = (x_norm - y_norm) ** 2
+            K_x = self.create_sim_matrix(wx)
+            K_y = self.create_sim_matrix(wy)
+
+            x_fro = torch.trace(K_x)
+            y_fro = torch.trace(K_y)
+
+            sq_trace = torch.norm(wx.T @wy, p="nuc")
+
+            return x_fro + y_fro - 2*sq_trace
 
         else:
-            X_params, Y_params = self.fit(X, Y)
-            norms = torch.linalg.norm(self.project(X, *X_params) - self.project(Y, *Y_params), ord="fro", dim=(1, 2))
+            if self.no_svd and X.shape[1] == 1:
+                mx, wx = self.partial_fit(X)
+                my, wy = self.partial_fit(Y)
+    
+                x_norm = torch.linalg.norm(wx, dim=(1, 2))
+                y_norm = torch.linalg.norm(wy, dim=(1, 2))
+    
+                norms = (x_norm - y_norm) ** 2
+    
+            else:
+                X_params, Y_params = self.fit(X, Y)
+                norms = torch.linalg.norm(self.project(X, *X_params) - self.project(Y, *Y_params), ord="fro", dim=(1, 2))
 
         if self.reduction == 'mean':
             return norms.mean()
@@ -121,42 +155,46 @@ class LinearMeasure(torch.nn.Module):
 
 
 class CKA(torch.nn.Module):
-    def __init__(self,dim_matching='zero_pad', reduction='mean', kernel="linear", similarity_token_strategy="flatten"):
+    def __init__(self,dim_matching='zero_pad', reduction='mean', kernel="linear", similarity_token_strategy="flatten", biased=False):
         super(CKA, self).__init__()
         assert dim_matching in [None, 'none', 'zero_pad', 'pca']
         self.dim_matching = dim_matching
         self.reduction = reduction
-        self.kernel=kernel
-        self.similarity_token_strategy=similarity_token_strategy
+        self.kernel= kernel
+        self.similarity_token_strategy= similarity_token_strategy
         self.random_tokens=None
+        self.biased = biased
 
 
     def generate_random_token_index(self, token_size, selected_size=10):
         self.random_tokens = random.sample(range(token_size),selected_size) 
     
-    def create_sim_matrix(self, X:Tensor, diag_zero=True):
+    def create_sim_matrix(self, X:Tensor):
         if self.similarity_token_strategy =="flatten":
             X=torch.flatten(X, end_dim=-2)
         elif self.similarity_token_strategy=="random":
             if not self.random_tokens:
                 self.generate_random_token_index(X.shape[1])
-            X=torch.fatten(X[:, self.random_tokens, :], end_dim=-2)
+            X=torch.flatten(X[:, self.random_tokens, :], end_dim=-2)
             
         """Similarity matrix"""
         if self.kernel == "linear":
             sim_m = X@ X.T
+        elif self.kernel == "gaussian":
+            sim_m = gaussian_kernel(X, X)
+            
+        return sim_m
+
+
+    def make_diag_zero(self,sim_m):
+        diagonal_mask = torch.eye(sim_m.shape[-1], dtype=torch.bool).unsqueeze(0).to(sim_m.device)
+
+        #has a batch dimension
+        if len(sim_m.shape)>2:
+            sim_m = sim_m.masked_fill(diagonal_mask, 0)
         else:
-            raise NotImplementedError
-
-        if diag_zero:
-            diagonal_mask = torch.eye(sim_m.shape[-1], dtype=torch.bool).unsqueeze(0).to(X.device)
-
-            #has a batch dimension
-            if len(sim_m.shape)>2:
-                sim_m.masked_fill_(diagonal_mask, 0)
-            else:
-                sim_m.masked_fill_(diagonal_mask[0], 0)
-        
+            sim_m = sim_m.masked_fill(diagonal_mask[0], 0)
+            
         return sim_m
 
 
@@ -164,18 +202,28 @@ class CKA(torch.nn.Module):
         """ K, L are similarity matrices of form (B,N,N) where B is batch or (N,N)
         """
         n=K.shape[-1]
-        if len(K.shape)==3:
-            pass
-            #TODO: IMPLEMENT BATCHED CKA
-            """
-            kl=torch.bmm(K,L)"""
-            
+        
+        if self.biased:
+            device = K.device
+            H = torch.eye(n, device=device) - (1/n) * torch.ones((n, 1), device=device) @ torch.ones((1, n), device=device)
+            kl = K@H@L@H
+            return (1/n**2) * kl.diagonal().sum()
+
         else:
-            kl=K@L
-            trace=kl.diagonal().sum()
-            middle=(K.sum()*L.sum())/((n-1)*(n-2))
-            last= -2*kl.sum()/(n-2)
-            return (trace+middle+last)/(n*(n-3))
+            K = self.make_diag_zero(K)
+            L = self.make_diag_zero(L)
+            if len(K.shape)==3:
+                pass
+                #TODO: IMPLEMENT BATCHED CKA
+                """
+                kl=torch.bmm(K,L)"""
+                
+            else:
+                kl=K@L
+                trace=kl.diagonal().sum()
+                middle=(K.sum()*L.sum())/((n-1)*(n-2))
+                last= -2*kl.sum()/(n-2)
+                return torch.abs ((trace+middle+last)/(n*(n-3))) 
 
 
     def forward(self, X: Tensor, Y: Tensor):
@@ -198,6 +246,7 @@ class CKA(torch.nn.Module):
             else:
                 raise ValueError(f'Unrecognized dimension matching {self.dim_matching}')
 
+        
         X_sim_matrix = self.create_sim_matrix(X)
         Y_sim_matrix = self.create_sim_matrix(Y)
 

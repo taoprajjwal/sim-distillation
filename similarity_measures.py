@@ -57,10 +57,10 @@ class LinearMeasure(torch.nn.Module):
         self.no_svd = no_svd
         self.approx = approx
 
-    def partial_fit(self, X: Tensor) -> Tuple[Tensor, Tensor]:
+    def partial_fit(self, X: Tensor, center_col_idx= 1) -> Tuple[Tensor, Tensor]:
         """Computes the mean centered columns. Can be replaced later by whitening transform for linear invarariances."""
         if self.center_columns:
-            mx = torch.mean(X, dim=1, keepdim=True)
+            mx = torch.mean(X, dim=center_col_idx, keepdim=True)
         else:
             mx = torch.zeros(X.shape[2], dtype=X.dtype, device=X.device)
         wx = X - mx
@@ -97,40 +97,42 @@ class LinearMeasure(torch.nn.Module):
         if X.shape[:-1] != Y.shape[:-1] or X.ndim != 3 or Y.ndim != 3:
             raise ValueError('Expected 3D input matrices to much in all dimensions but last.'
                              f'But got {X.shape} and {Y.shape} instead.')
-
-        if X.shape[-1] != Y.shape[-1]:
-            if self.dim_matching is None or self.dim_matching == 'none':
-                raise ValueError(f'Expected same dimension matrices got instead {X.shape} and {Y.shape}. '
-                                 f'Set dim_matching or change matrix dimensions.')
-            elif self.dim_matching == 'zero_pad':
-                size_diff = Y.shape[-1] - X.shape[-1]
-                if size_diff < 0:
-                    raise ValueError(f'With `zero_pad` dimension matching expected X dimension to be smaller then Y. '
-                                     f'But got {X.shape} and {Y.shape} instead.')
-                X = pad(X, (0, size_diff))
-            elif self.dim_matching == 'pca':
-                raise NotImplementedError
-            else:
-                raise ValueError(f'Unrecognized dimension matching {self.dim_matching}')
-
         if self.approx:
-            mx, wx = self.partial_fit(X)
-            my, wy = self.partial_fit(Y)
+            mx, wx = self.partial_fit(X, center_col_idx=0)
+            my, wy = self.partial_fit(Y, center_col_idx=0)
 
             wx=torch.flatten(wx,end_dim=-2)
             wy=torch.flatten(wy,end_dim=-2)
 
-            K_x = self.create_sim_matrix(wx)
-            K_y = self.create_sim_matrix(wy)
+            X_flat = torch.flatten(X, end_dim = -2)
+            Y_flat = torch.flatten(Y, end_dim = -2)
+            
+            K_x = X_flat.T @ wx
+            K_y = Y_flat.T @ wy
 
             x_fro = torch.trace(K_x)
             y_fro = torch.trace(K_y)
 
-            sq_trace = torch.norm(wx.T @wy, p="nuc")
+            sq_trace = torch.norm(X_flat.T @ wy , p="nuc")
 
             return x_fro + y_fro - 2*sq_trace
-
         else:
+            if X.shape[-1] != Y.shape[-1]:
+                if self.dim_matching is None or self.dim_matching == 'none':
+                    raise ValueError(f'Expected same dimension matrices got instead {X.shape} and {Y.shape}. '
+                                     f'Set dim_matching or change matrix dimensions.')
+                elif self.dim_matching == 'zero_pad':
+                    size_diff = Y.shape[-1] - X.shape[-1]
+                    if size_diff < 0:
+                        raise ValueError(f'With `zero_pad` dimension matching expected X dimension to be smaller then Y. '
+                                         f'But got {X.shape} and {Y.shape} instead.')
+                    X = pad(X, (0, size_diff))
+                elif self.dim_matching == 'pca':
+                    raise NotImplementedError
+                else:
+                    raise ValueError(f'Unrecognized dimension matching {self.dim_matching}')
+
+       
             if self.no_svd and X.shape[1] == 1:
                 mx, wx = self.partial_fit(X)
                 my, wy = self.partial_fit(Y)
